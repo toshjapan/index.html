@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kaiju Survival - カイジュウ・サバイバル</title>
+    <!-- Tailwind CSS for UI -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Firebase (Must be filled with your own config for standalone use) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // グローバルにFirebase関数をエクスポート
+        window.FB = { initializeApp, getAuth, signInAnonymously, getFirestore, doc, setDoc, onSnapshot };
+    </script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background: #87CEEB; }
+        canvas { display: block; }
+        .no-select { user-select: none; -webkit-user-select: none; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- 設定 ---
+        const MAX_HEALTH = 15;
+        const WEAPONS = {
+            WOODEN_AXE: { id: 'WOODEN_AXE', name: '木の斧', damage: 1, durability: 50, color: 0x8B4513, price: 0 },
+            IRON_SWORD: { id: 'IRON_SWORD', name: '鉄의 剣', damage: 2, durability: 100, color: 0xC0C0C0, price: 50 },
+            GOLD_SWORD: { id: 'GOLD_SWORD', name: '金の剣', damage: 3, durability: 200, color: 0xFFD700, price: 150 },
+            DIAMOND_BLADE: { id: 'DIAMOND_BLADE', name: 'ダイヤの刃', damage: 5, durability: 500, color: 0x00FFFF, price: 400 },
+        };
+
+        // LucideアイコンをReactコンポーネントとして使うための簡易ラッパー
+        const Icon = ({ name, ...props }) => {
+            const [svg, setSvg] = useState('');
+            useEffect(() => {
+                const icon = lucide.icons[name];
+                if (icon) {
+                    const svgString = Array.isArray(icon[2]) 
+                        ? icon[2].map(tag => `<${tag[0]} ${Object.entries(tag[1]).map(([k,v]) => `${k}="${v}"`).join(' ')} />`).join('')
+                        : '';
+                    setSvg(svgString);
+                }
+            }, [name]);
+            return <svg {...props} width={props.size || 24} height={props.size || 24} fill={props.fill || 'none'} stroke={props.color || 'currentColor'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" dangerouslySetInnerHTML={{ __html: svg }} />;
+        };
+
+        function App() {
+            const [gameState, setGameState] = useState({
+                stars: 0,
+                worldLevel: 1,
+                health: MAX_HEALTH,
+                currentWeapon: 'WOODEN_AXE',
+                durability: 50,
+            });
+            const [isShopOpen, setIsShopOpen] = useState(false);
+            const [isDead, setIsDead] = useState(false);
+            const [dbLoaded, setDbLoaded] = useState(false);
+
+            const containerRef = useRef();
+            const gameRef = useRef({
+                scene: null, camera: null, renderer: null,
+                player: { velocity: new THREE.Vector3(), canJump: true },
+                monsters: [], worldBlocks: [], keys: {},
+                axeMesh: null, isAttacking: false, lastAttackTime: 0, lastDamageTime: 0
+            });
+
+            // Firebaseの初期化 (ここではCanvas提供のグローバル変数を使用)
+            useEffect(() => {
+                const initFirebase = async () => {
+                    if (!window.FB) return;
+                    const { initializeApp, getAuth, signInAnonymously, getFirestore, doc, onSnapshot } = window.FB;
+                    
+                    try {
+                        const firebaseConfig = JSON.parse(window.__firebase_config || '{}');
+                        const app = initializeApp(firebaseConfig);
+                        const auth = getAuth(app);
+                        const db = getFirestore(app);
+                        const appId = window.__app_id || 'kaiju-survival-001';
+
+                        const userCredential = await signInAnonymously(auth);
+                        const user = userCredential.user;
+
+                        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'gameData', 'status');
+                        onSnapshot(docRef, (snap) => {
+                            if (snap.exists()) setGameState(prev => ({ ...prev, ...snap.data() }));
+                            setDbLoaded(true);
+                        });
+                    } catch (e) {
+                        console.log("Firebase not configured, using local state.");
+                        setDbLoaded(true);
+                    }
+                };
+                initFirebase();
+            }, []);
+
+            // Three.js Game Engine
+            useEffect(() => {
+                if (!dbLoaded || !containerRef.current) return;
+
+                const scene = new THREE.Scene();
+                scene.background = new THREE.Color(0x87CEEB);
+                scene.fog = new THREE.Fog(0x87CEEB, 20, 100);
+
+                const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                camera.position.set(0, 5, 10);
+                camera.rotation.order = 'YXZ';
+
+                const renderer = new THREE.WebGLRenderer({ antialias: true });
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                renderer.shadowMap.enabled = true;
+                containerRef.current.appendChild(renderer.domElement);
+
+                const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+                scene.add(ambientLight);
+                const sunLight = new THREE.DirectionalLight(0xffffff, 0.8);
+                sunLight.position.set(10, 50, 10);
+                sunLight.castShadow = true;
+                scene.add(sunLight);
+
+                // Weapon Model
+                const weaponGroup = new THREE.Group();
+                const handle = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.8, 0.1), new THREE.MeshLambertMaterial({ color: 0x5C4033 }));
+                const head = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.2, 0.1), new THREE.MeshLambertMaterial({ color: WEAPONS[gameState.currentWeapon].color }));
+                head.position.y = 0.3;
+                weaponGroup.add(handle, head);
+                weaponGroup.position.set(0.5, -0.5, -0.8);
+                camera.add(weaponGroup);
+                scene.add(camera);
+
+                gameRef.current = { ...gameRef.current, scene, camera, renderer, axeMesh: weaponGroup, axeHead: head };
+
+                // Input handling
+                const onKeyDown = (e) => gameRef.current.keys[e.code] = true;
+                const onKeyUp = (e) => gameRef.current.keys[e.code] = false;
+                const onMouseMove = (e) => {
+                    if (document.pointerLockElement === renderer.domElement) {
+                        camera.rotation.y -= e.movementX * 0.002;
+                        camera.rotation.x -= e.movementY * 0.002;
+                        camera.rotation.x = Math.max(-Math.PI/2.2, Math.min(Math.PI/2.2, camera.rotation.x));
+                    }
+                };
+                const onMouseDown = () => attack();
+
+                window.addEventListener('keydown', onKeyDown);
+                window.addEventListener('keyup', onKeyUp);
+                window.addEventListener('mousemove', onMouseMove);
+                window.addEventListener('mousedown', onMouseDown);
+
+                // Initial world
+                updateWorld();
+
+                let animId;
+                const clock = new THREE.Clock();
+                const loop = () => {
+                    const delta = clock.getDelta();
+                    updateGame(delta);
+                    renderer.render(scene, camera);
+                    animId = requestAnimationFrame(loop);
+                };
+                loop();
+
+                return () => {
+                    cancelAnimationFrame(animId);
+                    window.removeEventListener('keydown', onKeyDown);
+                    window.removeEventListener('keyup', onKeyUp);
+                    window.removeEventListener('mousemove', onMouseMove);
+                    window.removeEventListener('mousedown', onMouseDown);
+                    renderer.dispose();
+                };
+            }, [dbLoaded]);
+
+            // React State Sync to Game
+            useEffect(() => {
+                if (gameRef.current.axeHead) {
+                    gameRef.current.axeHead.material.color.setHex(WEAPONS[gameState.currentWeapon].color);
+                }
+                updateWorld();
+            }, [gameState.worldLevel, gameState.currentWeapon]);
+
+            const updateWorld = () => {
+                const { scene, worldBlocks } = gameRef.current;
+                if (!scene) return;
+                worldBlocks.forEach(b => scene.remove(b));
+                const size = 5 + gameState.worldLevel * 5;
+                const floor = new THREE.Mesh(new THREE.BoxGeometry(size, 1, size), new THREE.MeshLambertMaterial({ color: 0x228B22 }));
+                floor.position.y = -0.5;
+                floor.receiveShadow = true;
+                scene.add(floor);
+                gameRef.current.worldBlocks = [floor];
+                gameRef.current.worldSize = size;
+            };
+
+            const updateGame = (delta) => {
+                const { camera, keys, player, worldSize, monsters, axeMesh, isAttacking } = gameRef.current;
+                if (!camera) return;
+
+                // Move
+                const moveZ = (keys['KeyW'] ? -1 : 0) + (keys['KeyS'] ? 1 : 0);
+                const moveX = (keys['KeyA'] ? -1 : 0) + (keys['KeyD'] ? 1 : 0);
+                const dir = new THREE.Vector3(moveX, 0, moveZ).normalize().applyEuler(new THREE.Euler(0, camera.rotation.y, 0));
+                
+                player.velocity.x = dir.x * 8;
+                player.velocity.z = dir.z * 8;
+                if (keys['Space'] && player.canJump) { player.velocity.y = 8; player.canJump = false; }
+                player.velocity.y -= 20 * delta;
+
+                camera.position.addScaledVector(new THREE.Vector3(player.velocity.x, 0, player.velocity.z), delta);
+                camera.position.y += player.velocity.y * delta;
+
+                // Physics & Fall
+                const half = worldSize / 2;
+                const onIsland = Math.abs(camera.position.x) < half && Math.abs(camera.position.z) < half;
+                if (camera.position.y < 1.6 && onIsland) {
+                    camera.position.y = 1.6;
+                    player.velocity.y = 0;
+                    player.canJump = true;
+                }
+                if (camera.position.y < -10) {
+                    camera.position.set(0, 5, 0);
+                    player.velocity.set(0,0,0);
+                    setGameState(p => ({ ...p, health: Math.max(0, p.health - 1) }));
+                }
+
+                // Monsters
+                if (monsters.length < 3 + gameState.worldLevel && Math.random() < 0.01) spawnMonster();
+                const now = Date.now();
+                monsters.forEach((m, i) => {
+                    const toPlayer = new THREE.Vector3().subVectors(camera.position, m.position);
+                    toPlayer.y = 0;
+                    const dist = toPlayer.length();
+                    if (dist > 1.2) m.position.addScaledVector(toPlayer.normalize(), (2 + gameState.worldLevel * 0.5) * delta);
+                    else if (now - gameRef.current.lastDamageTime > 1500 && !isDead) {
+                        gameRef.current.lastDamageTime = now;
+                        setGameState(p => ({ ...p, health: Math.max(0, p.health - 1) }));
+                    }
+                    m.position.y = 1 + Math.sin(now * 0.005) * 0.2;
+                });
+
+                // Weapon animation
+                if (gameRef.current.isAttacking) {
+                    const elapsed = now - gameRef.current.lastAttackTime;
+                    if (elapsed < 150) axeMesh.rotation.x = -Math.PI/4 - (elapsed/150) * Math.PI/2;
+                    else if (elapsed < 300) axeMesh.rotation.x = -Math.PI/4 - Math.PI/2 + ((elapsed-150)/150) * Math.PI/2;
+                    else gameRef.current.isAttacking = false;
+                }
+            };
+
+            const spawnMonster = () => {
+                const { scene, monsters, worldSize } = gameRef.current;
+                const m = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.8, 0.8), new THREE.MeshLambertMaterial({ color: 0x800080 }));
+                const angle = Math.random() * Math.PI * 2;
+                const r = worldSize / 2 - 1;
+                m.position.set(Math.cos(angle)*r, 1, Math.sin(angle)*r);
+                m.userData = { hp: 2 + gameState.worldLevel };
+                scene.add(m);
+                monsters.push(m);
+            };
+
+            const attack = () => {
+                if (gameState.durability <= 0 || isDead || isShopOpen) return;
+                if (document.pointerLockElement !== gameRef.current.renderer.domElement) return;
+
+                gameRef.current.isAttacking = true;
+                gameRef.current.lastAttackTime = Date.now();
+                
+                let hit = false;
+                gameRef.current.monsters.forEach((m, i) => {
+                    if (gameRef.current.camera.position.distanceTo(m.position) < 3) {
+                        m.userData.hp -= WEAPONS[gameState.currentWeapon].damage;
+                        hit = true;
+                        if (m.userData.hp <= 0) {
+                            gameRef.current.scene.remove(m);
+                            gameRef.current.monsters.splice(i, 1);
+                            setGameState(p => ({ ...p, stars: p.stars + 1 }));
+                        }
+                    }
+                });
+                if (hit) setGameState(p => ({ ...p, durability: Math.max(0, p.durability - 1) }));
+            };
+
+            useEffect(() => { if (gameState.health <= 0) setIsDead(true); }, [gameState.health]);
+
+            return (
+                <div className="relative w-full h-screen no-select">
+                    <div ref={containerRef} className="w-full h-full" onClick={() => !isShopOpen && !isDead && gameRef.current.renderer.domElement.requestPointerLock()} />
+                    
+                    {/* HUD */}
+                    <div className="absolute top-4 left-4 flex gap-1 p-2 bg-black/20 rounded-lg">
+                        {Array.from({ length: MAX_HEALTH }).map((_, i) => (
+                            <Icon key={i} name="heart" size={20} fill={i < gameState.health ? "#ff4d4d" : "none"} color="#ff4d4d" className={i < gameState.health ? "animate-pulse" : "opacity-20"} />
+                        ))}
+                    </div>
+
+                    <div className="absolute top-4 right-4 flex flex-col items-end gap-2">
+                        <div className="bg-yellow-500 text-white px-4 py-2 rounded-full font-bold shadow-lg flex items-center gap-2">
+                            <Icon name="star" size={18} fill="white" /> {gameState.stars}
+                        </div>
+                        <div className="bg-black/40 text-white p-2 rounded text-xs text-right">
+                            {WEAPONS[gameState.currentWeapon].name}: {gameState.durability} / {WEAPONS[gameState.currentWeapon].durability}
+                            <div className="w-32 h-1 bg-gray-700 mt-1"><div className="h-full bg-green-400" style={{ width: `${(gameState.durability/WEAPONS[gameState.currentWeapon].durability)*100}%` }} /></div>
+                        </div>
+                    </div>
+
+                    <button onClick={() => { document.exitPointerLock(); setIsShopOpen(true); }} className="absolute bottom-6 right-6 bg-blue-600 text-white p-4 rounded-full shadow-xl">
+                        <Icon name="shopping-cart" size={28} />
+                    </button>
+
+                    {isShopOpen && (
+                        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-6 z-50">
+                            <div className="bg-white rounded-2xl p-6 w-full max-w-sm text-gray-800">
+                                <div className="flex justify-between items-center mb-4">
+                                    <h2 className="text-xl font-bold">ショップ</h2>
+                                    <button onClick={() => setIsShopOpen(false)}>✕</button>
+                                </div>
+                                <div className="space-y-3">
+                                    <button onClick={() => {
+                                        const cost = gameState.worldLevel * 20;
+                                        if (gameState.stars >= cost) setGameState(p => ({ ...p, stars: p.stars - cost, worldLevel: p.worldLevel + 1 }));
+                                    }} disabled={gameState.stars < gameState.worldLevel * 20} className="w-full flex justify-between p-3 bg-gray-100 rounded-lg disabled:opacity-50">
+                                        <span>島の拡張 (Lv.{gameState.worldLevel})</span>
+                                        <span className="font-bold">★{gameState.worldLevel * 20}</span>
+                                    </button>
+                                    {Object.values(WEAPONS).filter(w => w.price > 0).map(w => (
+                                        <button key={w.id} onClick={() => {
+                                            if (gameState.stars >= w.price) setGameState(p => ({ ...p, stars: p.stars - w.price, currentWeapon: w.id, durability: w.durability }));
+                                        }} disabled={gameState.stars < w.price || gameState.currentWeapon === w.id} className="w-full flex justify-between p-3 bg-gray-100 rounded-lg disabled:opacity-50">
+                                            <span>{w.name}</span>
+                                            <span className="font-bold">★{w.price}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {isDead && (
+                        <div className="absolute inset-0 bg-red-900/90 flex flex-col items-center justify-center text-white z-[100]">
+                            <h1 className="text-6xl font-black mb-4">GAME OVER</h1>
+                            <button onClick={() => { setGameState(p => ({ ...p, health: MAX_HEALTH, durability: WEAPONS[p.currentWeapon].durability })); setIsDead(false); }} className="bg-white text-red-600 px-8 py-3 rounded-full font-bold text-xl">再挑戦</button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
